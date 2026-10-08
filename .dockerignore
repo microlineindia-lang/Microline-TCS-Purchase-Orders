@@ -1,0 +1,34 @@
+﻿# Google credentials
+*.json
+*.pem
+*.key
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+
+# Local runtime files
+*.log
+Backups/
+tcs_ariba_purchase_orders.xlsx
+
+# Git
+.git/
+.gitignore
+
+# Editors / OS
+.vscode/
+.idea/
+*.tmp
+*.bak
+Thumbs.db
+Desktop.ini
+
+# Documentation not needed in the container
+DEPLOY.md
