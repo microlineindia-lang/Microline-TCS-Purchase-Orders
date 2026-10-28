@@ -1,0 +1,25 @@
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+service-account*.json
+credentials*.json
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local runtime files
+*.log
+Backups/
+tcs_ariba_purchase_orders.xlsx
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini

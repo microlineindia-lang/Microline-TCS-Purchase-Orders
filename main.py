@@ -17,9 +17,15 @@ POST /api/upload-status   apply Order Status edits from a downloaded,
                           why this is safe even with a stale file
 GET  /healthz             liveness probe
 POST /api/refresh/scheduled
-                          daily 8 AM refresh, called by Cloud Scheduler
-                          (needs the X-Cron-Token header); see
-                          AUTO_REFRESH_* settings below
+                          daily 8 AM refresh, called by a free external
+                          cron (GitHub Actions); needs the X-Cron-Token
+                          header; see AUTO_REFRESH_* settings below
+
+Access
+------
+Every route except /healthz, /login, /auth/* and the token-protected
+scheduled endpoint requires a Google sign-in from an allow-listed
+account (default microlineindia@gmail.com). See auth.py.
 
 Two refresh actions, two speeds
 --------------------------------
@@ -34,7 +40,7 @@ waiting for a Gmail scan.
 
 Why the Sheet is the source of truth
 ------------------------------------
-Cloud Run containers are ephemeral: any file written to local disk
+Hosted containers are ephemeral: any file written to local disk
 disappears when the instance scales down. Rather than bolt on a
 bucket, the Google Sheet holds the data. Refresh writes to it and
 Download reads from it, so the downloaded workbook always reflects
@@ -44,6 +50,19 @@ stateless.
 
 from __future__ import annotations
 
+# Load a local .env file (if present) BEFORE importing the modules below:
+# tcs_engine reads TCS_GMAIL_APP_PASSWORD at import time. On a hosting
+# platform you set real environment variables instead and there is no
+# .env file, in which case this does nothing.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv()
+except ImportError:
+    pass
+
+import base64
+import json
 import logging
 import os
 import threading
@@ -61,6 +80,7 @@ from zoneinfo import ZoneInfo
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
+import auth
 import sheets
 import tcs_engine as engine
 
@@ -71,7 +91,7 @@ import tcs_engine as engine
 SPREADSHEET_ID = os.getenv("TCS_SPREADSHEET_ID", "").strip()
 WORKSHEET_NAME = os.getenv("TCS_WORKSHEET_NAME", "Orders").strip() or "Orders"
 
-# On Cloud Run the only writable location is /tmp.
+# Free hosts have ephemeral disks; /tmp is always writable.
 WORK_DIR = Path(os.getenv("TCS_WORK_DIR", "/tmp/tcs"))
 
 engine.ORDER_DIR = WORK_DIR
@@ -84,12 +104,13 @@ WORK_DIR.mkdir(parents=True, exist_ok=True)
 # ---- Last-refresh record and automatic daily refresh --------------
 #
 # When a refresh last ran is stored in a small "Meta" worksheet in the
-# same Google Sheet (the Sheet is the source of truth; Cloud Run's local
+# same Google Sheet (the Sheet is the source of truth; the host's local
 # disk is not).
 #
-# The daily refresh is normally triggered by Cloud Scheduler calling
-# POST /api/refresh/scheduled with the header X-Cron-Token, which works
-# even when Cloud Run has scaled to zero. Set TCS_CRON_TOKEN to enable it.
+# The daily refresh is normally triggered by a free external cron (GitHub
+# Actions) calling POST /api/refresh/scheduled with the header
+# X-Cron-Token, which also wakes the app if the host put it to sleep.
+# Set TCS_CRON_TOKEN to enable it.
 #
 # For a machine that stays on (e.g. local Windows), set
 # TCS_AUTO_REFRESH_LOCAL=1 instead to run a small built-in scheduler.
@@ -105,8 +126,16 @@ AUTO_REFRESH_LOCAL = os.getenv("TCS_AUTO_REFRESH_LOCAL", "").strip() in {
     "yes",
 }
 
+# True (default): POST /api/refresh/scheduled starts the import in the
+# background and returns 202 straight away, so a slow Gmail scan can't hit
+# a proxy timeout. Set to 0 to run it inside the request instead (what
+# Cloud Run needed, because it freezes the CPU between requests).
+SCHEDULED_BACKGROUND = os.getenv(
+    "TCS_SCHEDULED_BACKGROUND", "1"
+).strip().lower() in {"1", "true", "yes"}
+
 # A scheduled call is skipped if a refresh already succeeded this recently
-# (protects against Cloud Scheduler retries and double triggers).
+# (protects against scheduler retries and double triggers).
 SCHEDULED_SKIP_MINUTES = 30
 
 LOCAL_TZ = ZoneInfo(TIMEZONE_NAME)
@@ -122,13 +151,17 @@ logger = logging.getLogger("tcs.console")
 
 app = FastAPI(title="TCS Purchase Orders", docs_url=None, redoc_url=None)
 
+# Login gate: only the addresses in TCS_ALLOWED_EMAILS (default
+# microlineindia@gmail.com) can use the app. See auth.py.
+auth.install(app)
+
 # ============================================================
 # JOB TRACKING
 # ============================================================
 #
-# In-process job state. Cloud Run must therefore run this service
-# with a single instance for polling to stay consistent -- see
-# DEPLOY.md (min-instances 1, max-instances 1). If you later need
+# In-process job state. The service must therefore run as a single
+# instance with a single worker for polling to stay consistent -- see
+# DEPLOY.md. If you later need
 # several instances, move this into Firestore or Redis; the shape
 # below is deliberately easy to swap since every mutation goes
 # through _new_job / _log / _progress / _set_stage / _finish.
@@ -237,26 +270,60 @@ def _finish(job_id: str, **fields: Any) -> None:
 # ============================================================
 
 
+_SERVICE_ACCOUNT_INFO: dict[str, Any] | None = None
+_SERVICE_ACCOUNT_LOADED = False
+
+
+def _service_account_info() -> dict[str, Any] | None:
+    """
+    GOOGLE_SERVICE_ACCOUNT_JSON holds the service-account key itself
+    (the whole JSON, or the same JSON base64-encoded). This is the
+    easiest option on free hosts, where you can set secrets but not
+    upload files.
+    """
+
+    global _SERVICE_ACCOUNT_INFO, _SERVICE_ACCOUNT_LOADED
+
+    if _SERVICE_ACCOUNT_LOADED:
+        return _SERVICE_ACCOUNT_INFO
+
+    _SERVICE_ACCOUNT_LOADED = True
+    raw = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+
+    if not raw:
+        return None
+
+    try:
+        if not raw.startswith("{"):
+            raw = base64.b64decode(raw).decode("utf-8")
+        _SERVICE_ACCOUNT_INFO = json.loads(raw)
+    except Exception as exc:
+        raise RuntimeError(
+            "GOOGLE_SERVICE_ACCOUNT_JSON is set but is not valid JSON "
+            "(or base64-encoded JSON)."
+        ) from exc
+
+    return _SERVICE_ACCOUNT_INFO
+
+
 def _sheet_kwargs() -> dict[str, Any]:
     """
-    Local Windows: if GOOGLE_APPLICATION_CREDENTIALS points to an
-    existing JSON file, use it.
+    Where the Google credentials come from, in priority order:
 
-    Cloud Run: if no credential file is configured, return an empty
-    dict -- sheets.py then falls back to Application Default
-    Credentials, i.e. the Cloud Run service identity.
+    1. GOOGLE_SERVICE_ACCOUNT_JSON   the key contents (hosting platforms)
+    2. GOOGLE_APPLICATION_CREDENTIALS path to a key file (local machine)
+    3. Application Default Credentials (only works on Google Cloud)
     """
+
+    info = _service_account_info()
+    if info:
+        return {"credentials_info": info}
 
     path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS", "").strip()
 
     if path and Path(path).exists():
-        logger.info("Using local Google service-account JSON")
         return {"credentials_path": path}
 
-    logger.info(
-        "Using Google Application Default Credentials "
-        "(Cloud Run service identity)"
-    )
     return {}
 
 
@@ -269,7 +336,7 @@ def _require_config() -> None:
 
     if not engine.PASSWORD:
         raise RuntimeError(
-            "TCS_GMAIL_APP_PASSWORD is not set. Add it as a secret."
+            "TCS_GMAIL_APP_PASSWORD is not set. Add it as a secret / env var."
         )
 
 
@@ -507,10 +574,12 @@ def refresh_scheduled(
     x_cron_token: str | None = Header(default=None),
 ) -> JSONResponse:
     """
-    Called once a day by Cloud Scheduler. Runs the import inside this
-    request (rather than in a background thread) so Cloud Run keeps
-    CPU allocated until it finishes. Set the Cloud Run request timeout
-    and the Scheduler attempt deadline to 15+ minutes.
+    Called once a day by an external scheduler (the GitHub Actions
+    workflow in .github/workflows/daily-refresh.yml). Not behind the
+    Google login -- protected by the X-Cron-Token header instead.
+
+    By default the import runs in a background thread and this returns
+    202 immediately (TCS_SCHEDULED_BACKGROUND=0 runs it inline).
     """
 
     if not CRON_TOKEN:
@@ -539,6 +608,17 @@ def refresh_scheduled(
         return JSONResponse({"skipped": "a refresh is already running"})
 
     job_id = _new_job()
+
+    if SCHEDULED_BACKGROUND:
+        threading.Thread(
+            target=_run_import, args=(job_id, "scheduled"), daemon=True
+        ).start()
+        # Result (or failure) is recorded in the Meta sheet and shown on
+        # the dashboard once the import finishes.
+        return JSONResponse(
+            {"state": "started", "job_id": job_id}, status_code=202
+        )
+
     _run_import(job_id, trigger="scheduled")
 
     with _jobs_lock:

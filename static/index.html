@@ -413,10 +413,20 @@
   @media (max-width: 360px) {
     .figures { grid-template-columns: 1fr; }
   }
+
+  .whoami { display:flex; justify-content:flex-end; align-items:center; gap:10px;
+            font-size:13px; color:#5b6b8c; padding:8px 2px 0; }
+  .whoami[hidden] { display:none; }
+  .whoami button { all:unset; cursor:pointer; color:#1f4e9c; text-decoration:underline; }
 </style>
 </head>
 <body>
 <div class="wrap">
+
+  <div class="whoami" id="whoami" hidden>
+    <span id="whoami-email"></span>
+    <button type="button" id="btn-signout">Sign out</button>
+  </div>
 
   <header class="masthead">
     <div class="brand-row">
@@ -800,6 +810,30 @@ $("status-file-input").addEventListener("change", async (event) => {
 });
 
 loadSummary(false);
+</script>
+<script>
+// Session handling: if the login expires, any API call returns 401 and
+// we send the person back to the sign-in page.
+(function () {
+  const realFetch = window.fetch.bind(window);
+  window.fetch = async function (...args) {
+    const res = await realFetch(...args);
+    if (res.status === 401) { location.href = "/login"; }
+    return res;
+  };
+
+  realFetch("/api/me").then(r => r.ok ? r.json() : null).then(d => {
+    if (d && d.email) {
+      document.getElementById("whoami-email").textContent = "Signed in as " + d.email;
+      document.getElementById("whoami").hidden = false;
+    }
+  }).catch(() => {});
+
+  document.getElementById("btn-signout").addEventListener("click", async () => {
+    await realFetch("/auth/logout", { method: "POST" });
+    location.href = "/login";
+  });
+})();
 </script>
 </body>
 </html>

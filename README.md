@@ -16,17 +16,22 @@ The application does the following:
 - Preserves human-edited `Order Status` values while refreshing data
 - Exposes a web console to trigger manual refreshes and check progress
 - Allows users to download the current workbook in Excel format
-- Supports scheduled refreshes via Cloud Scheduler or a local scheduler
+- Restricts access to allow-listed Google accounts (default `microlineindia@gmail.com`)
+- Supports scheduled refreshes via a free GitHub Actions cron or a local scheduler
 
 ## Why this project exists
 
 Microline India receives purchase orders from TCS through Ariba email notifications. Those emails contain structured PO details, but they are not easy to track in a clean operational register. This project automates the extraction and maintains a central Sheet storing the latest state of purchase orders.
 
-The system keeps the Google Sheet as the source of truth for operational status, which prevents lost data during Cloud Run restarts and allows teammates to update order statuses without overwriting their edits during a new import.
+The system keeps the Google Sheet as the source of truth for operational status, which prevents lost data when the host restarts and allows teammates to update order statuses without overwriting their edits during a new import.
 
 ## Project structure
 
 - `main.py` — FastAPI web app, routes, job tracking, scheduled refresh logic
+- `auth.py` — Google Sign-In login gate and email allow-list
+- `.env.example` — every setting, with comments
+- `DEPLOY.md` — free hosting and setup guide
+- `.github/workflows/daily-refresh.yml` — free daily 8 AM trigger
 - `tcs_engine.py` — email parsing, Excel generation, normalization, order processing
 - `sheets.py` — Google Sheets read/write logic and status synchronization
 - `static/index.html` — web dashboard UI
@@ -75,7 +80,7 @@ The FastAPI UI shows:
 The app supports:
 
 - Manual refresh through the web UI
-- Daily scheduled refresh via Cloud Scheduler
+- Daily scheduled refresh via GitHub Actions
 - Local scheduler support using environment-based configuration
 
 ## Technology stack
@@ -95,31 +100,38 @@ The app supports:
 
 Before running the app, make sure you have:
 
-- A Google Cloud project with access to Google Sheets
-- A service account JSON file or Application Default Credentials configured
+- A free Google Cloud project (no billing needed) with the Sheets API enabled
+- A service account key, shared as Editor on the Sheet
+- An OAuth client id for Google Sign-In
 - A Gmail account with an app password for IMAP access
 - A Google Sheet containing or accepting the required PO data structure
-- Access to Cloud Run or another hosting environment if deploying remotely
+- A hosting environment if deploying remotely (see `DEPLOY.md`)
 
 ## Environment variables
 
-Set the following environment variables before running the app:
+See `.env.example` for a ready-to-fill template and `DEPLOY.md` for how to get each value.
 
 ### Required
 
 - `TCS_SPREADSHEET_ID` — the Google Sheet ID to read/write
 - `TCS_GMAIL_APP_PASSWORD` — Gmail app password used for IMAP access
+- `GOOGLE_SERVICE_ACCOUNT_JSON` — full contents of the service-account key (or `GOOGLE_APPLICATION_CREDENTIALS` = path to the key file, for local runs)
+- `GOOGLE_CLIENT_ID` — OAuth web client id for Google Sign-In
+- `TCS_SESSION_SECRET` — long random string used to sign login cookies
 
 ### Optional
 
-- `TCS_WORKSHEET_NAME` — sheet tab name, default: `Orders`
-- `TCS_META_WORKSHEET` — metadata sheet name, default: `Meta`
-- `TCS_TIMEZONE` — time zone used for scheduling, default: `Asia/Kolkata`
-- `TCS_AUTO_REFRESH_TIME` — scheduled refresh time in `HH:MM`, default: `08:00`
-- `TCS_CRON_TOKEN` — token to validate scheduled refresh requests
-- `TCS_AUTO_REFRESH_LOCAL` — enable a local background scheduler when running on a local machine
-- `GOOGLE_APPLICATION_CREDENTIALS` — local path to a service account JSON file
-- `PORT` — used by container platforms such as Cloud Run
+- `TCS_ALLOWED_EMAILS` — comma-separated accounts allowed in, default `microlineindia@gmail.com`
+- `TCS_SESSION_HOURS` — login lifetime, default `12`
+- `TCS_WORKSHEET_NAME` — sheet tab name, default `Orders`
+- `TCS_META_WORKSHEET` — metadata sheet name, default `Meta`
+- `TCS_TIMEZONE` — time zone for scheduling, default `Asia/Kolkata`
+- `TCS_AUTO_REFRESH_TIME` — scheduled refresh time in `HH:MM`, default `08:00`
+- `TCS_CRON_TOKEN` — secret that the daily GitHub Actions job sends as `X-Cron-Token`
+- `TCS_SCHEDULED_BACKGROUND` — run scheduled imports in the background (default `1`)
+- `TCS_AUTO_REFRESH_LOCAL` — built-in scheduler for an always-on local machine
+- `TCS_AUTH_DISABLED` — turns login off; **local testing only**
+- `PORT` — set automatically by hosting platforms
 
 ## Local setup
 
@@ -151,39 +163,22 @@ uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
 http://localhost:8000/
 ```
 
-## Docker deployment
+## Deployment
 
-The repository includes a Dockerfile for deployment in containerized environments such as Google Cloud Run.
+The app runs anywhere that can run a Docker container or Python 3.12. The recommended
+free setup is **Render (free web service) + a GitHub Actions daily cron**; the full
+step-by-step guide, including the Google sign-in setup, is in [`DEPLOY.md`](DEPLOY.md).
 
-Build the image:
+Run the container locally:
 
 ```bash
 docker build -t microline-tcs-purchase-orders .
+docker run -p 8080:8080 --env-file .env microline-tcs-purchase-orders
 ```
 
-Run locally:
+Run only **one instance with one worker**: job progress is kept in memory.
 
-```bash
-docker run -p 8080:8080 \
-  -e TCS_SPREADSHEET_ID="your_sheet_id" \
-  -e TCS_GMAIL_APP_PASSWORD="your_gmail_app_password" \
-  -e GOOGLE_APPLICATION_CREDENTIALS="/tmp/credentials.json" \
-  microline-tcs-purchase-orders
-```
-
-## Cloud Run deployment
-
-This app is designed to run on Google Cloud Run with a single worker, which is important because the job state is kept in memory for polling and progress tracking.
-
-Recommended deployment approach:
-
-- Use Cloud Run with a single instance
-- Set `TCS_SPREADSHEET_ID` and `TCS_GMAIL_APP_PASSWORD` as environment variables or secrets
-- Configure Google Cloud service account credentials via Application Default Credentials
-- Use Cloud Scheduler to trigger the scheduled endpoint
-- Protect the scheduled endpoint with the `TCS_CRON_TOKEN` header and matching `X-Cron-Token`
-
-Example scheduled refresh endpoint:
+Scheduled refresh endpoint (called by the GitHub Actions workflow):
 
 ```text
 POST /api/refresh/scheduled
@@ -194,14 +189,15 @@ Header: X-Cron-Token: your-secret-token
 
 The service exposes the following HTTP endpoints:
 
-- `GET /` — web dashboard
-- `GET /healthz` — health check
+- `GET /` — web dashboard (login required)
+- `GET /login`, `POST /auth/google`, `POST /auth/logout`, `GET /api/me` — sign-in flow
+- `GET /healthz` — health check (public)
 - `POST /api/refresh` — start a new Gmail refresh job
 - `GET /api/jobs/{job_id}` — poll a running job status
 - `GET /api/summary` — read current sheet summary
 - `GET /api/download` — download the generated Excel workbook
 - `POST /api/upload-status` — apply edited status values back to the sheet
-- `POST /api/refresh/scheduled` — scheduled refresh endpoint
+- `POST /api/refresh/scheduled` — scheduled refresh endpoint (token-protected, not behind login)
 
 ## Data flow
 
@@ -218,13 +214,14 @@ The service exposes the following HTTP endpoints:
 ## Notes on reliability
 
 - The Google Sheet is the system of record for order status, not the local filesystem.
-- Cloud Run instances are ephemeral, so local generated files are not relied upon for persistence.
+- Hosted instances are ephemeral, so local generated files are not relied upon for persistence.
 - Job tracking is intentionally in-memory and assumes single-instance operation for consistent polling behavior.
 - The app logs refresh attempts and success events to a metadata sheet for operational visibility.
 
 ## Security considerations
 
 - Store secrets in environment variables or cloud secret management, not in source code.
+- Every route except `/healthz`, the sign-in flow and the token-protected scheduled endpoint requires a Google sign-in from an allow-listed account.
 - Protect scheduled endpoints with a token header when exposed publicly.
 - Restrict Google service account permissions to the minimum needed.
 - Keep Gmail app-password credentials out of version control.
