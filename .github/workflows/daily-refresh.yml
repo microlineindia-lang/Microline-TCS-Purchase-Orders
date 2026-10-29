@@ -13,7 +13,11 @@ on:
 jobs:
   refresh:
     runs-on: ubuntu-latest
+<<<<<<< HEAD
     timeout-minutes: 55
+=======
+    timeout-minutes: 20
+>>>>>>> 4403d3150e8c3240d61887e1ad88e7fffaf95cee
     env:
       APP_URL_RAW: ${{ secrets.APP_URL }}
       CRON_TOKEN: ${{ secrets.TCS_CRON_TOKEN }}
@@ -35,6 +39,7 @@ jobs:
         run: |
           APP_URL=$(printf '%s' "$APP_URL_RAW" | tr -d '[:space:]')
           APP_URL="${APP_URL%/}"
+<<<<<<< HEAD
 
           resp=$(curl --fail-with-body -sS -X POST --max-time 120 \
             -H "X-Cron-Token: $CRON_TOKEN" \
@@ -65,6 +70,21 @@ jobs:
             state=$(echo "$body" | jq -r '.state // empty' 2>/dev/null || true)
             if [ "$state" = "done" ]; then echo "Import finished."; exit 0; fi
             if [ "$state" = "error" ]; then echo "Import FAILED."; exit 1; fi
+=======
+          curl --fail-with-body -sS -X POST --max-time 120 \
+            -H "X-Cron-Token: $CRON_TOKEN" \
+            "$APP_URL/api/refresh/scheduled"
+
+      # Free hosts sleep an app after ~15 idle minutes, and a background import
+      # does not count as traffic. Ping it so it stays awake until the scan ends.
+      - name: Keep the app awake while the import runs
+        run: |
+          APP_URL=$(printf '%s' "$APP_URL_RAW" | tr -d '[:space:]')
+          APP_URL="${APP_URL%/}"
+          for i in $(seq 1 10); do
+            sleep 60
+            curl -s -o /dev/null --max-time 30 "$APP_URL/healthz" || true
+>>>>>>> 4403d3150e8c3240d61887e1ad88e7fffaf95cee
           done
 
           echo "Import did not finish within 45 minutes."; exit 1
