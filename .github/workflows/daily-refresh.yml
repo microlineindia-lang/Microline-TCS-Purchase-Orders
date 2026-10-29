@@ -7,18 +7,21 @@ name: Daily TCS refresh
 on:
   schedule:
     - cron: "30 2 * * *"
-  workflow_dispatch:   # lets you run it by hand from the Actions tab
+  workflow_dispatch:
 
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     env:
-      APP_URL: ${{ secrets.APP_URL }}          # e.g. https://your-app.onrender.com (no trailing slash)
+      APP_URL_RAW: ${{ secrets.APP_URL }}
       CRON_TOKEN: ${{ secrets.TCS_CRON_TOKEN }}
     steps:
       - name: Wake the app
         run: |
+          APP_URL=$(printf '%s' "$APP_URL_RAW" | tr -d '[:space:]')
+          APP_URL="${APP_URL%/}"
+          echo "Checking $APP_URL/healthz"
           for i in $(seq 1 30); do
             code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 30 "$APP_URL/healthz" || true)
             echo "attempt $i: HTTP $code"
@@ -29,6 +32,8 @@ jobs:
 
       - name: Trigger refresh
         run: |
+          APP_URL=$(printf '%s' "$APP_URL_RAW" | tr -d '[:space:]')
+          APP_URL="${APP_URL%/}"
           curl --fail-with-body -sS -X POST --max-time 120 \
             -H "X-Cron-Token: $CRON_TOKEN" \
             "$APP_URL/api/refresh/scheduled"
@@ -37,6 +42,8 @@ jobs:
       # does not count as traffic. Ping it so it stays awake until the scan ends.
       - name: Keep the app awake while the import runs
         run: |
+          APP_URL=$(printf '%s' "$APP_URL_RAW" | tr -d '[:space:]')
+          APP_URL="${APP_URL%/}"
           for i in $(seq 1 10); do
             sleep 60
             curl -s -o /dev/null --max-time 30 "$APP_URL/healthz" || true
