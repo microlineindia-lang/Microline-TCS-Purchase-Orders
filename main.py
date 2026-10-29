@@ -632,6 +632,40 @@ def refresh_scheduled(
     return JSONResponse({"state": "done", "result": job["result"]})
 
 
+@app.get("/api/refresh/scheduled/status")
+def refresh_scheduled_status(
+    job_id: str,
+    x_cron_token: str | None = Header(default=None),
+) -> JSONResponse:
+    """
+    Lets the scheduler poll a scheduled import until it really finishes
+    (and learn whether it succeeded). 404 means the app restarted and
+    the job was lost. Same X-Cron-Token protection as the trigger.
+    """
+
+    if not CRON_TOKEN:
+        raise HTTPException(status_code=503, detail="Not enabled.")
+
+    if not x_cron_token or not hmac.compare_digest(x_cron_token, CRON_TOKEN):
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+
+        if job is None:
+            raise HTTPException(status_code=404, detail="Unknown job")
+
+        return JSONResponse(
+            {
+                "state": job["state"],
+                "stage": job["stage_label"],
+                "progress_pct": job["progress_pct"],
+                "error": job["error"],
+                "result": job["result"],
+            }
+        )
+
+
 def _scheduler_loop() -> None:
     """
     Optional in-process daily scheduler (TCS_AUTO_REFRESH_LOCAL=1).

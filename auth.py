@@ -20,7 +20,8 @@ Exempt from the login gate
 --------------------------
 /healthz                    liveness probe, returns {"status": "ok"}
 /login, /auth/*             the sign-in flow itself
-/api/refresh/scheduled      protected by its own secret header
+/api/refresh/scheduled[/status]
+                            protected by its own secret header
                             (X-Cron-Token) instead -- see main.py
 """
 
@@ -73,7 +74,10 @@ _serializer = URLSafeTimedSerializer(_secret, salt="tcs-session")
 COOKIE_NAME = "tcs_session"
 
 PUBLIC_PATHS = {"/healthz", "/login", "/auth/google", "/auth/logout"}
-TOKEN_PROTECTED_PATHS = {"/api/refresh/scheduled"}
+TOKEN_PROTECTED_PATHS = {
+    "/api/refresh/scheduled",
+    "/api/refresh/scheduled/status",
+}
 
 
 # ------------------------------------------------------------------
